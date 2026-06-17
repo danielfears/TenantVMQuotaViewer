@@ -2,7 +2,6 @@
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5391FE?style=flat-square&logo=powershell&logoColor=white)
 ![Azure](https://img.shields.io/badge/Azure-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)
-![License](https://img.shields.io/github/license/danielfears/TenantVMQuotaViewer?style=flat-square)
 ![Stars](https://img.shields.io/github/stars/danielfears/TenantVMQuotaViewer?style=flat-square&logo=github)
 ![Forks](https://img.shields.io/github/forks/danielfears/TenantVMQuotaViewer?style=flat-square&logo=github)
 ![Last commit](https://img.shields.io/github/last-commit/danielfears/TenantVMQuotaViewer?style=flat-square)
