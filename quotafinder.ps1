@@ -542,42 +542,24 @@ function ConvertTo-QuotaHtmlReport {
 function Connect-ToAzure {
     <#
     .SYNOPSIS
-        Ensures an Az PowerShell context exists, reusing an existing context or an
-        active Azure CLI session, otherwise falling back to device code auth.
+        Ensures an Az PowerShell context exists, reusing an existing context
+        otherwise authenticating via device code.
+    .NOTES
+        Bridging an Azure CLI access token into Az PowerShell (Connect-AzAccount
+        -AccessToken) proved unreliable on Az.Accounts 5.x: the token is accepted
+        for the connection but rejected during subscription enumeration
+        ("The access token is invalid"). Native device code authentication is used
+        instead for reliability. An existing Az PowerShell session is still reused.
     #>
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
-        'PSAvoidUsingConvertToSecureStringWithPlainText', '',
-        Justification = 'The Azure CLI returns an in-memory plaintext access token; Az.Accounts 5.x requires it as a SecureString for Connect-AzAccount.')]
     [CmdletBinding()]
     param()
 
     $context = Get-AzContext -ErrorAction SilentlyContinue
-    if ($context) { return $context }
-
-    $azCliAccount = $null
-    if (Get-Command az -ErrorAction SilentlyContinue) {
-        $azCliJson = az account show 2>$null
-        if ($LASTEXITCODE -eq 0 -and $azCliJson) {
-            $azCliAccount = $azCliJson | ConvertFrom-Json
-        }
+    if ($context) {
+        return $context
     }
 
-    if ($azCliAccount) {
-        try {
-            Write-Host "Found active Azure CLI session for: $($azCliAccount.user.name)" -ForegroundColor Green
-            Write-Host 'Connecting Az PowerShell using CLI session...' -ForegroundColor Cyan
-            $tokenInfo = az account get-access-token --resource https://management.azure.com 2>$null | ConvertFrom-Json
-            # Az.Accounts 5.x requires the access token as a SecureString.
-            $secureToken = ConvertTo-SecureString -String $tokenInfo.accessToken -AsPlainText -Force
-            Connect-AzAccount -AccessToken $secureToken -AccountId $azCliAccount.user.name -Tenant $azCliAccount.tenantId -ErrorAction Stop | Out-Null
-            return Get-AzContext
-        }
-        catch {
-            Write-Warning "Could not reuse the Azure CLI session ($_). Falling back to device code authentication..."
-        }
-    }
-
-    Write-Host 'Initiating device code authentication...' -ForegroundColor Yellow
+    Write-Host 'No existing Azure PowerShell session found. Initiating device code authentication...' -ForegroundColor Yellow
     Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop | Out-Null
     return Get-AzContext
 }
@@ -696,6 +678,13 @@ function Invoke-QuotaReport {
         [switch]$PassThru,
         [switch]$FailOnThreshold
     )
+
+    # `pwsh -File` passes comma-separated values as a single string rather than an
+    # array; normalise so both `-File` and call-operator invocations behave the same.
+    $Location = @($Location | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+    if ($SubscriptionId) {
+        $SubscriptionId = @($SubscriptionId | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+    }
 
     # Import required Azure modules
     try {
