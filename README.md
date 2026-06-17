@@ -19,6 +19,7 @@ This script iterates through every subscription in your Azure tenant and retriev
 - ✅ **Automatic Authentication** - Reuses an existing Az PowerShell session, or prompts for device code authentication
 - ✅ **Parameterised** - Region(s), output path, usage threshold and subscription scope are all command-line parameters; no need to edit the script
 - ✅ **Multi-Region** - Scan one or many regions in a single run; results are aggregated per SKU and per region
+- ✅ **Parallel Scanning** - Optional `-ThrottleLimit` scans many subscriptions concurrently for large tenants, with deterministic results
 - ✅ **Tenant-Wide Scanning** - Iterates through all accessible subscriptions (or a supplied subset)
 - ✅ **VM vCPU Quotas** - Filters to compute-related quotas (vCPUs, Virtual Machines, Availability Sets, etc.)
 - ✅ **App Service Plan Quotas** - Retrieves worker SKU quotas (F1, B1, P1v4, EP3, WS1, etc.) via the Microsoft.Quota resource provider
@@ -88,6 +89,7 @@ pwsh -File ./quotafinder.ps1
 | `-OutputPath` | Path of the HTML report to write | `QuotaReport.html` (current dir) |
 | `-Threshold` | Usage % (1-100) treated as high/critical | `80` |
 | `-SubscriptionId` | Restrict the scan to specific subscription IDs | all accessible |
+| `-ThrottleLimit` | Number of subscriptions to scan in parallel (1 = sequential) | `1` |
 | `-ExportCsv` | Also export raw per-subscription results to CSV | off |
 | `-ExportJson` | Also export the aggregated summaries to JSON | off |
 | `-PassThru` | Emit the VM and App Service summaries to the pipeline | off |
@@ -102,6 +104,9 @@ pwsh -File ./quotafinder.ps1
 # Scope to two subscriptions and write to a specific path
 ./quotafinder.ps1 -SubscriptionId 1111-..., 2222-... -OutputPath ./reports/quota.html
 
+# Large tenant: scan 8 subscriptions at a time (much faster)
+./quotafinder.ps1 -ThrottleLimit 8
+
 # CI gate: fail the pipeline if anything is at 85%+
 ./quotafinder.ps1 -Threshold 85 -FailOnThreshold
 
@@ -109,6 +114,8 @@ pwsh -File ./quotafinder.ps1
 $summary = ./quotafinder.ps1 -PassThru
 $summary.Vm | Where-Object UsagePercentage -ge 80
 ```
+
+> **Performance:** by default subscriptions are scanned sequentially (with a progress bar). On large tenants, `-ThrottleLimit` scans several at once — each in its own isolated Azure context, so results are identical to a sequential run. Requires PowerShell 7+.
 
 The script will:
 1. Check for an existing Az PowerShell session, otherwise prompt for device code authentication
