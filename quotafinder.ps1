@@ -38,6 +38,11 @@
 .PARAMETER FailOnThreshold
     Return a non-zero exit code if any SKU is at or above the threshold. Useful for CI.
 
+.PARAMETER ThrottleLimit
+    Number of subscriptions to scan in parallel. 1 (the default) scans sequentially
+    with a progress bar. Higher values speed up large tenants; each parallel call is
+    scoped to its own Azure context, so results are not affected by ordering.
+
 .EXAMPLE
     ./quotafinder.ps1
     Scans all subscriptions for UK South and writes QuotaReport.html.
@@ -46,8 +51,12 @@
     ./quotafinder.ps1 -Location uksouth,ukwest -Threshold 90 -ExportCsv
     Scans two regions, flags SKUs at 90%+, and also writes CSV exports.
 
+.EXAMPLE
+    ./quotafinder.ps1 -ThrottleLimit 8
+    Scans all subscriptions 8 at a time - much faster on large tenants.
+
 .NOTES
-    Version: 1.1.0
+    Version: 1.2.0
     Requires the Az.Accounts and Az.Compute modules. Needs Reader on the target
     subscriptions; App Service quotas additionally require the Microsoft.Quota
     resource provider to be registered.
@@ -62,6 +71,9 @@ param(
     [int]$Threshold = 80,
 
     [string[]]$SubscriptionId,
+
+    [ValidateRange(1, 50)]
+    [int]$ThrottleLimit = 1,
 
     [switch]$ExportCsv,
 
@@ -156,7 +168,7 @@ function Get-QuotaSkuSummary {
 
         $subscriptionDetails = $group |
             Where-Object { $_.CurrentUsage -gt 0 -or $_.Limit -gt 0 } |
-            Sort-Object -Property CurrentUsage -Descending |
+            Sort-Object -Property @{ Expression = 'CurrentUsage'; Descending = $true }, @{ Expression = 'SubscriptionName'; Descending = $false } |
             Select-Object SubscriptionName, SubscriptionId, CurrentUsage, Limit, UsagePercentage
 
         [PSCustomObject]@{
@@ -168,7 +180,7 @@ function Get-QuotaSkuSummary {
             SubscriptionCount   = $group.Count
             SubscriptionDetails = $subscriptionDetails
         }
-    } | Sort-Object -Property UsagePercentage -Descending
+    } | Sort-Object -Property @{ Expression = 'UsagePercentage'; Descending = $true }, @{ Expression = 'ResourceType'; Descending = $false }, @{ Expression = 'Location'; Descending = $false }
 }
 
 function ConvertTo-QuotaTableHtml {
@@ -569,7 +581,11 @@ function Get-TenantQuotaData {
     <#
     .SYNOPSIS
         Collects raw VM and App Service Plan quota results for the given subscriptions
-        and regions.
+        and regions, sequentially or in parallel.
+    .NOTES
+        Each subscription is scanned against its own Azure context, passed explicitly
+        via -DefaultProfile, so parallel execution does not race on the shared global
+        context.
     #>
     [CmdletBinding()]
     param(
@@ -577,51 +593,58 @@ function Get-TenantQuotaData {
         [object[]]$Subscriptions,
 
         [Parameter(Mandatory)]
-        [string[]]$Location
+        [string[]]$Location,
+
+        [int]$ThrottleLimit = 1
     )
 
-    $vmResults = @()
-    $aspResults = @()
+    # Self-contained per-subscription scan (no external function dependencies, so it
+    # can run unchanged inside parallel runspaces).
+    $scanBlock = {
+        param([object]$Subscription, [string[]]$Locations)
 
-    foreach ($subscription in $Subscriptions) {
-        Write-Host "Processing subscription: $($subscription.Name) ($($subscription.Id))" -ForegroundColor Cyan
+        $vm = [System.Collections.Generic.List[object]]::new()
+        $asp = [System.Collections.Generic.List[object]]::new()
 
         try {
-            Set-AzContext -SubscriptionId $subscription.Id -ErrorAction Stop | Out-Null
+            $ctx = Set-AzContext -SubscriptionId $Subscription.Id -ErrorAction Stop
         }
         catch {
-            Write-Warning "Could not set context for subscription $($subscription.Name): $_"
-            continue
+            Write-Warning "Could not set context for subscription $($Subscription.Name): $_"
+            return [PSCustomObject]@{ Vm = $vm.ToArray(); Asp = $asp.ToArray() }
         }
 
-        foreach ($loc in $Location) {
+        foreach ($loc in $Locations) {
             # VM quota usage
             try {
-                $vmUsage = Get-AzVMUsage -Location $loc -ErrorAction Stop
+                $vmUsage = Get-AzVMUsage -Location $loc -DefaultProfile $ctx -ErrorAction Stop
                 foreach ($usage in $vmUsage) {
                     $resourceName = $usage.Name.LocalizedValue
                     if ($resourceName -match 'vCPU|Virtual Machine|Availability Sets|Dedicated|Low-priority') {
-                        $vmResults += [PSCustomObject]@{
-                            SubscriptionName = $subscription.Name
-                            SubscriptionId   = $subscription.Id
-                            Location         = $loc
-                            ResourceType     = $resourceName
-                            CurrentUsage     = $usage.CurrentValue
-                            Limit            = $usage.Limit
-                            UsagePercentage  = Get-UsagePercentage -Used $usage.CurrentValue -Limit $usage.Limit
-                        }
+                        $limit = [double]$usage.Limit
+                        $used = [double]$usage.CurrentValue
+                        $pct = if ($limit -gt 0) { [math]::Round(($used / $limit) * 100, 2) } else { 0 }
+                        $vm.Add([PSCustomObject]@{
+                                SubscriptionName = $Subscription.Name
+                                SubscriptionId   = $Subscription.Id
+                                Location         = $loc
+                                ResourceType     = $resourceName
+                                CurrentUsage     = $usage.CurrentValue
+                                Limit            = $usage.Limit
+                                UsagePercentage  = $pct
+                            })
                     }
                 }
             }
             catch {
-                Write-Warning "Could not retrieve VM quota for $loc in subscription $($subscription.Name): $_"
+                Write-Warning "Could not retrieve VM quota for $loc in subscription $($Subscription.Name): $_"
             }
 
             # App Service Plan quota usage via the Microsoft.Quota RP
             try {
-                $aspBasePath = "/subscriptions/$($subscription.Id)/providers/Microsoft.Web/locations/$loc/providers/Microsoft.Quota"
-                $usagesResponse = Invoke-AzRestMethod -Path "$aspBasePath/usages?api-version=2023-06-01-preview" -Method GET -ErrorAction Stop
-                $quotasResponse = Invoke-AzRestMethod -Path "$aspBasePath/quotas?api-version=2023-06-01-preview" -Method GET -ErrorAction Stop
+                $aspBasePath = "/subscriptions/$($Subscription.Id)/providers/Microsoft.Web/locations/$loc/providers/Microsoft.Quota"
+                $usagesResponse = Invoke-AzRestMethod -Path "$aspBasePath/usages?api-version=2023-06-01-preview" -Method GET -DefaultProfile $ctx -ErrorAction Stop
+                $quotasResponse = Invoke-AzRestMethod -Path "$aspBasePath/quotas?api-version=2023-06-01-preview" -Method GET -DefaultProfile $ctx -ErrorAction Stop
 
                 if ($usagesResponse.StatusCode -eq 200 -and $quotasResponse.StatusCode -eq 200) {
                     $aspUsages = ($usagesResponse.Content | ConvertFrom-Json).value
@@ -640,27 +663,63 @@ function Get-TenantQuotaData {
                         $rawUsage = $usage.properties.usages.value
                         if ($null -eq $rawUsage) { $rawUsage = 0 }
                         $currentUsage = [math]::Max([double]$rawUsage, 0)
-                        $limit = if ($limitLookup.ContainsKey($skuName)) { $limitLookup[$skuName] } else { 0 }
+                        $limit = if ($limitLookup.ContainsKey($skuName)) { [double]$limitLookup[$skuName] } else { 0 }
+                        $pct = if ($limit -gt 0) { [math]::Round(($currentUsage / $limit) * 100, 2) } else { 0 }
 
-                        $aspResults += [PSCustomObject]@{
-                            SubscriptionName = $subscription.Name
-                            SubscriptionId   = $subscription.Id
-                            Location         = $loc
-                            ResourceType     = $resourceName
-                            CurrentUsage     = $currentUsage
-                            Limit            = $limit
-                            UsagePercentage  = Get-UsagePercentage -Used $currentUsage -Limit $limit
-                        }
+                        $asp.Add([PSCustomObject]@{
+                                SubscriptionName = $Subscription.Name
+                                SubscriptionId   = $Subscription.Id
+                                Location         = $loc
+                                ResourceType     = $resourceName
+                                CurrentUsage     = $currentUsage
+                                Limit            = $limit
+                                UsagePercentage  = $pct
+                            })
                     }
                 }
             }
             catch {
-                Write-Warning "Could not retrieve App Service quota for $loc in subscription $($subscription.Name): $_"
+                Write-Warning "Could not retrieve App Service quota for $loc in subscription $($Subscription.Name): $_"
             }
         }
+
+        return [PSCustomObject]@{ Vm = $vm.ToArray(); Asp = $asp.ToArray() }
     }
 
-    return @{ Vm = $vmResults; Asp = $aspResults }
+    $vmResults = [System.Collections.Generic.List[object]]::new()
+    $aspResults = [System.Collections.Generic.List[object]]::new()
+    $total = @($Subscriptions).Count
+
+    if ($ThrottleLimit -gt 1) {
+        Write-Host "Scanning $total subscription(s) in parallel (throttle: $ThrottleLimit)..." -ForegroundColor Cyan
+        $scanText = $scanBlock.ToString()
+        $partials = $Subscriptions | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+            Import-Module Az.Accounts -ErrorAction SilentlyContinue
+            Import-Module Az.Compute -ErrorAction SilentlyContinue
+            # Avoid contention on the shared on-disk context cache between runspaces.
+            Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
+            $sb = [scriptblock]::Create($using:scanText)
+            & $sb $_ $using:Location
+        }
+        foreach ($p in $partials) {
+            if ($p.Vm) { $vmResults.AddRange([object[]]$p.Vm) }
+            if ($p.Asp) { $aspResults.AddRange([object[]]$p.Asp) }
+        }
+    }
+    else {
+        $i = 0
+        foreach ($subscription in $Subscriptions) {
+            $i++
+            Write-Progress -Activity 'Scanning subscriptions' -Status "$i of $total : $($subscription.Name)" -PercentComplete (($i / $total) * 100)
+            Write-Host "Processing subscription: $($subscription.Name) ($($subscription.Id))" -ForegroundColor Cyan
+            $p = & $scanBlock $subscription $Location
+            if ($p.Vm) { $vmResults.AddRange([object[]]$p.Vm) }
+            if ($p.Asp) { $aspResults.AddRange([object[]]$p.Asp) }
+        }
+        Write-Progress -Activity 'Scanning subscriptions' -Completed
+    }
+
+    return @{ Vm = $vmResults.ToArray(); Asp = $aspResults.ToArray() }
 }
 
 # ----------------------------------------------------------------------------
@@ -674,10 +733,9 @@ function Invoke-QuotaReport {
         [string]$OutputPath,
         [int]$Threshold,
         [string[]]$SubscriptionId,
+        [int]$ThrottleLimit = 1,
         [switch]$ExportCsv,
-        [switch]$ExportJson,
-        [switch]$PassThru,
-        [switch]$FailOnThreshold
+        [switch]$ExportJson
     )
 
     # `pwsh -File` passes comma-separated values as a single string rather than an
@@ -693,8 +751,7 @@ function Invoke-QuotaReport {
         Import-Module Az.Compute -ErrorAction Stop
     }
     catch {
-        Write-Error 'Failed to import required Az modules. Install with: Install-Module -Name Az.Accounts, Az.Compute -Scope CurrentUser'
-        exit 1
+        throw 'Failed to import required Az modules. Install with: Install-Module -Name Az.Accounts, Az.Compute -Scope CurrentUser'
     }
 
     # Authenticate
@@ -704,8 +761,7 @@ function Invoke-QuotaReport {
         Write-Host "Tenant: $($context.Tenant.Id)" -ForegroundColor Green
     }
     catch {
-        Write-Error "Failed to authenticate to Azure: $_"
-        exit 1
+        throw "Failed to authenticate to Azure: $_"
     }
 
     # Resolve subscriptions
@@ -716,30 +772,29 @@ function Invoke-QuotaReport {
         }
         if (-not $subscriptions) {
             Write-Warning 'No subscriptions found (or none matched the supplied -SubscriptionId).'
-            exit 0
+            return
         }
         Write-Host "Found $(@($subscriptions).Count) subscription(s) to process." -ForegroundColor Green
     }
     catch {
-        Write-Error "Failed to retrieve subscriptions: $_"
-        exit 1
+        throw "Failed to retrieve subscriptions: $_"
     }
 
     # Collect quota data
-    $data = Get-TenantQuotaData -Subscriptions $subscriptions -Location $Location
+    $data = Get-TenantQuotaData -Subscriptions $subscriptions -Location $Location -ThrottleLimit $ThrottleLimit
     $vmResults = $data.Vm
     $aspResults = $data.Asp
 
     # Console output
     Write-Host "`nVM Quota Results:" -ForegroundColor Cyan
-    $vmResults | Format-Table -AutoSize
+    $vmResults | Format-Table -AutoSize | Out-Host
     Write-Host "`nApp Service Plan Quota Results:" -ForegroundColor Cyan
-    $aspResults | Format-Table -AutoSize
+    $aspResults | Format-Table -AutoSize | Out-Host
 
     Write-Host "`nVM Quotas with usage over $Threshold%:" -ForegroundColor Yellow
-    $vmResults | Where-Object { $_.UsagePercentage -ge $Threshold } | Format-Table -AutoSize
+    $vmResults | Where-Object { $_.UsagePercentage -ge $Threshold } | Format-Table -AutoSize | Out-Host
     Write-Host "`nApp Service Quotas with usage over $Threshold%:" -ForegroundColor Yellow
-    $aspResults | Where-Object { $_.UsagePercentage -ge $Threshold } | Format-Table -AutoSize
+    $aspResults | Where-Object { $_.UsagePercentage -ge $Threshold } | Format-Table -AutoSize | Out-Host
 
     # Aggregate
     $vmSummary = @(Get-QuotaSkuSummary -Results $vmResults)
@@ -786,24 +841,33 @@ function Invoke-QuotaReport {
         Write-Host "JSON exported: $jsonPath" -ForegroundColor Green
     }
 
-    if ($PassThru) {
-        [PSCustomObject]@{
-            Vm         = $vmSummary
-            AppService = $aspSummary
-        }
-    }
-
-    if ($FailOnThreshold) {
-        $breaches = @(($vmSummary + $aspSummary) | Where-Object { $_.UsagePercentage -ge $Threshold })
-        if ($breaches.Count -gt 0) {
-            Write-Warning "$($breaches.Count) SKU(s) at or above $Threshold% usage."
-            exit 1
-        }
+    $breaches = @(($vmSummary + $aspSummary) | Where-Object { $_.UsagePercentage -ge $Threshold })
+    return [PSCustomObject]@{
+        Vm                = $vmSummary
+        AppService        = $aspSummary
+        ThresholdBreached = ($breaches.Count -gt 0)
     }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    Invoke-QuotaReport -Location $Location -OutputPath $OutputPath -Threshold $Threshold `
-        -SubscriptionId $SubscriptionId -ExportCsv:$ExportCsv -ExportJson:$ExportJson `
-        -PassThru:$PassThru -FailOnThreshold:$FailOnThreshold
+    try {
+        $result = Invoke-QuotaReport -Location $Location -OutputPath $OutputPath -Threshold $Threshold `
+            -SubscriptionId $SubscriptionId -ThrottleLimit $ThrottleLimit `
+            -ExportCsv:$ExportCsv -ExportJson:$ExportJson
+
+        if ($PassThru -and $result) {
+            [PSCustomObject]@{ Vm = $result.Vm; AppService = $result.AppService }
+        }
+
+        if ($FailOnThreshold -and $result -and $result.ThresholdBreached) {
+            Write-Warning 'One or more SKUs are at or above the threshold.'
+            [Console]::Out.Flush()
+            exit 1
+        }
+    }
+    catch {
+        Write-Error $_
+        [Console]::Out.Flush()
+        exit 1
+    }
 }
