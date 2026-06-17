@@ -16,7 +16,7 @@ This script iterates through every subscription in your Azure tenant and retriev
 
 ## Features
 
-- ✅ **Automatic Authentication** - Detects existing Az PowerShell session, reuses active Azure CLI session, or prompts for device code authentication
+- ✅ **Automatic Authentication** - Reuses an existing Az PowerShell session, or prompts for device code authentication
 - ✅ **Parameterised** - Region(s), output path, usage threshold and subscription scope are all command-line parameters; no need to edit the script
 - ✅ **Multi-Region** - Scan one or many regions in a single run; results are aggregated per SKU and per region
 - ✅ **Tenant-Wide Scanning** - Iterates through all accessible subscriptions (or a supplied subset)
@@ -111,7 +111,7 @@ $summary.Vm | Where-Object UsagePercentage -ge 80
 ```
 
 The script will:
-1. Check for an existing Azure session (Az PowerShell context, Azure CLI session, or device code authentication)
+1. Check for an existing Az PowerShell session, otherwise prompt for device code authentication
 2. Retrieve all subscriptions in your tenant (or those passed via `-SubscriptionId`)
 3. Query VM quotas for the requested region(s) across all subscriptions
 4. Query App Service Plan quotas via the Microsoft.Quota RP (where registered)
