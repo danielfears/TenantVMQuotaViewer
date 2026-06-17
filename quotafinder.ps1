@@ -47,6 +47,7 @@
     Scans two regions, flags SKUs at 90%+, and also writes CSV exports.
 
 .NOTES
+    Version: 1.1.0
     Requires the Az.Accounts and Az.Compute modules. Needs Reader on the target
     subscriptions; App Service quotas additionally require the Microsoft.Quota
     resource provider to be registered.
